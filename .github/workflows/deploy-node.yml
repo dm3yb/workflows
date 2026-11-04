@@ -1,0 +1,208 @@
+name: deploy-node
+
+# Builds a Node app image, pushes ghcr.io/dm3yb/<app>:<sha>, and deploys it blue/green through the
+# server's forced command (server/deploy in dm3yb/infra). Called with `secrets: inherit`.
+#
+# Server contract (two SSH calls, pinned host key):
+#   env <app>          stdin: the app's env file (secret named by env-file-secret)
+#   node <app> <sha>   stdin: a registry token for a one-time GHCR pull; empty for a rollback,
+#                      so the server uses the image it already has
+#
+# Caller job permissions: contents: read, packages: write.
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: App name on the server and in GHCR (ghcr.io/dm3yb/<app>)
+        type: string
+        required: true
+      public-url:
+        description: Public URL whose /api/health must report the new SHA
+        type: string
+        required: true
+      dockerfile:
+        description: Dockerfile path
+        type: string
+        default: Dockerfile
+      context:
+        description: Docker build context
+        type: string
+        default: .
+      build-args:
+        description: Build args, one KEY=value per line (GIT_SHA is always set)
+        type: string
+        default: ''
+      env-file-secret:
+        description: Name of the secret holding the app's runtime env file
+        type: string
+        default: APP_ENV_FILE
+      sha:
+        description: Rollback to this commit's image (already on the server); empty builds github.sha
+        type: string
+        default: ''
+      keep-images:
+        description: Image versions kept in GHCR
+        type: number
+        default: 3
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: inputs.sha == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: build-${{ inputs.app }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push ghcr.io/dm3yb/${{ inputs.app }}:${{ github.sha }}
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ghcr.io/dm3yb/${{ inputs.app }}:${{ github.sha }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            ${{ inputs.build-args }}
+          secrets: |
+            sentry_auth_token=${{ secrets.SENTRY_AUTH_TOKEN }}
+            server_actions_key=${{ secrets.NEXT_SERVER_ACTIONS_ENCRYPTION_KEY }}
+          cache-from: type=gha,scope=${{ inputs.app }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.app }}
+      - name: Check the Sentry release
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          [[ -n "$SENTRY_AUTH_TOKEN" ]] || { echo "::warning::SENTRY_AUTH_TOKEN is not set: no source maps"; exit 0; }
+          curl -fsS -o /dev/null -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" \
+            "https://de.sentry.io/api/0/organizations/aerixity/releases/$GITHUB_SHA/" \
+            || echo "::warning::Sentry release $GITHUB_SHA not found: source maps were not uploaded"
+
+  deploy:
+    needs: build
+    # After a successful build, or alone for a rollback (build skipped).
+    if: always() && (needs.build.result == 'success' || (inputs.sha != '' && needs.build.result == 'skipped'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: deploy-${{ inputs.app }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write # the server pulls with this token; retention deletes old versions
+    steps:
+      - name: Commit to deploy
+        id: sha
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=${INPUT_SHA:-$GITHUB_SHA}
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::not a full git SHA: $sha"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          # Freshness guard: a deploy never moves backwards. Rollbacks (INPUT_SHA set) bypass it.
+          skip=false
+          if [[ -z "$INPUT_SHA" ]]; then
+            head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+            if [[ "$head" != "$sha" ]]; then
+              echo "::notice::main moved on to $head; skipping the deploy of $sha"
+              skip=true
+            fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+      - name: SSH key and pinned host key
+        if: steps.sha.outputs.skip == 'false'
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY_V2 }}
+          DEPLOY_KNOWN_HOSTS: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+        run: |
+          [[ -n "$DEPLOY_SSH_KEY" ]] || { echo "::error::DEPLOY_SSH_KEY_V2 is not set"; exit 1; }
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf 'Host target\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/deploy\n  IdentitiesOnly yes\n  BatchMode yes\n  StrictHostKeyChecking yes\n' \
+            "$DEPLOY_HOST" "$DEPLOY_USER" > ~/.ssh/config
+
+      - name: Write the env file
+        if: steps.sha.outputs.skip == 'false'
+        env:
+          APP: ${{ inputs.app }}
+          ENV_FILE: ${{ secrets[inputs.env-file-secret] }}
+          SECRET_NAME: ${{ inputs.env-file-secret }}
+        run: |
+          [[ -n "$ENV_FILE" ]] || { echo "::error::secret $SECRET_NAME is empty or not set"; exit 1; }
+          # shellcheck disable=SC2029  # the arguments go to the forced command on the server
+          printf '%s\n' "$ENV_FILE" | ssh target env "$APP"
+
+      # Blue/green on the server. A rollback sends no token: the server uses its local image.
+      - name: Deploy ${{ steps.sha.outputs.sha }}
+        if: steps.sha.outputs.skip == 'false'
+        env:
+          APP: ${{ inputs.app }}
+          SHA: ${{ steps.sha.outputs.sha }}
+          TOKEN: ${{ inputs.sha == '' && secrets.GITHUB_TOKEN || '' }}
+        run: |
+          # shellcheck disable=SC2029
+          printf '%s\n' "$TOKEN" | ssh target node "$APP" "$SHA"
+
+      # Until a domain's cutover, SMOKE_VIA_ORIGIN=true sends the check straight to the server.
+      - name: Smoke test
+        if: steps.sha.outputs.skip == 'false'
+        env:
+          URL: ${{ inputs.public-url }}
+          SHA: ${{ steps.sha.outputs.sha }}
+          VIA_ORIGIN: ${{ vars.SMOKE_VIA_ORIGIN }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+        run: |
+          args=(-fsS --max-time 10)
+          if [[ "$VIA_ORIGIN" == "true" ]]; then args+=(-k --resolve "${URL#https://}:443:$DEPLOY_HOST"); fi
+          for _ in $(seq 1 10); do
+            if body=$(curl "${args[@]}" "$URL/api/health") && [[ "$body" == *"\"sha\":\"$SHA\""* ]]; then
+              curl "${args[@]}" -o /dev/null -w "GET / -> %{http_code}\n" "$URL/"
+              echo "live: $body"; exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::$URL/api/health does not report $SHA"; exit 1
+
+      - name: Mark the Sentry release as deployed
+        if: steps.sha.outputs.skip == 'false'
+        continue-on-error: true
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          [[ -n "$SENTRY_AUTH_TOKEN" ]] || exit 0
+          curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" -H 'Content-Type: application/json' \
+            -d '{"environment":"production"}' "https://de.sentry.io/api/0/organizations/aerixity/releases/$SHA/deploys/"
+
+      # Keep the newest image versions in GHCR. The one just deployed is the newest, so it stays;
+      # older images the server still holds remain usable for a rollback (it sends no token).
+      - name: Prune old image versions
+        if: steps.sha.outputs.skip == 'false' && inputs.sha == ''
+        continue-on-error: true
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ inputs.app }}
+          package-type: container
+          min-versions-to-keep: ${{ inputs.keep-images }}
