@@ -1,0 +1,208 @@
+name: ci-next
+
+# Checks for a Next.js app: lint, typecheck, test and build as parallel jobs, plus an optional
+# Docker build without push. Callers set `concurrency: ci-${{ github.ref }}` with cancel-in-progress.
+# deploy-static.yml reuses the build job with `release` set, to stamp and upload the export.
+
+on:
+  workflow_call:
+    inputs:
+      package-manager:
+        description: pnpm, bun or yarn (yarn 1)
+        type: string
+        default: pnpm
+      node-version:
+        description: Node version; leave empty to use node-version-file
+        type: string
+        default: ''
+      node-version-file:
+        description: File with the Node version, relative to working-directory
+        type: string
+        default: ''
+      working-directory:
+        description: Directory with package.json (the repo root, or one workspace)
+        type: string
+        default: .
+      env:
+        description: 'JSON object of environment values for every job, e.g. {"SKIP_ENV_VALIDATION":"1"}'
+        type: string
+        default: '{}'
+      lint:
+        description: Lint command; empty skips the job
+        type: string
+        default: ''
+      typecheck:
+        description: Typecheck command; empty skips the job
+        type: string
+        default: ''
+      test:
+        description: Test command; empty skips the job
+        type: string
+        default: ''
+      build:
+        description: Build command; empty skips the job
+        type: string
+        default: ''
+      build-env:
+        description: JSON object of public build-time values (NEXT_PUBLIC_*), for the build job only
+        type: string
+        default: '{}'
+      export-dir:
+        description: Static export directory, relative to working-directory; checked for index.html and 404.html
+        type: string
+        default: ''
+      release:
+        description: Release id; when set, writes <export-dir>/version.txt and uploads the export as artifact "site"
+        type: string
+        default: ''
+      docker-file:
+        description: Dockerfile to build without pushing; empty skips the job
+        type: string
+        default: ''
+      docker-context:
+        description: Docker build context
+        type: string
+        default: .
+      docker-build-args:
+        description: Extra build args, one KEY=value per line (GIT_SHA is always set)
+        type: string
+        default: ''
+      docker-cache-scope:
+        description: GitHub Actions cache scope for the image layers (use the app name)
+        type: string
+        default: app
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    if: inputs.lint != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Environment
+        env:
+          ENV_JSON: ${{ inputs.env }}
+        run: jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$ENV_JSON" >> "$GITHUB_ENV"
+      - uses: dm3yb/workflows/.github/actions/setup@v1
+        with:
+          package-manager: ${{ inputs.package-manager }}
+          node-version: ${{ inputs.node-version }}
+          node-version-file: ${{ inputs.node-version-file }}
+          working-directory: ${{ inputs.working-directory }}
+      - name: Lint
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.lint }}
+
+  typecheck:
+    if: inputs.typecheck != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Environment
+        env:
+          ENV_JSON: ${{ inputs.env }}
+        run: jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$ENV_JSON" >> "$GITHUB_ENV"
+      - uses: dm3yb/workflows/.github/actions/setup@v1
+        with:
+          package-manager: ${{ inputs.package-manager }}
+          node-version: ${{ inputs.node-version }}
+          node-version-file: ${{ inputs.node-version-file }}
+          working-directory: ${{ inputs.working-directory }}
+      - name: Typecheck
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.typecheck }}
+
+  test:
+    if: inputs.test != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Environment
+        env:
+          ENV_JSON: ${{ inputs.env }}
+        run: jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$ENV_JSON" >> "$GITHUB_ENV"
+      - uses: dm3yb/workflows/.github/actions/setup@v1
+        with:
+          package-manager: ${{ inputs.package-manager }}
+          node-version: ${{ inputs.node-version }}
+          node-version-file: ${{ inputs.node-version-file }}
+          working-directory: ${{ inputs.working-directory }}
+      - name: Test
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.test }}
+
+  build:
+    if: inputs.build != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Environment
+        env:
+          ENV_JSON: ${{ inputs.env }}
+          BUILD_ENV_JSON: ${{ inputs.build-env }}
+        run: |
+          jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$ENV_JSON" >> "$GITHUB_ENV"
+          jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$BUILD_ENV_JSON" >> "$GITHUB_ENV"
+      - uses: dm3yb/workflows/.github/actions/setup@v1
+        with:
+          package-manager: ${{ inputs.package-manager }}
+          node-version: ${{ inputs.node-version }}
+          node-version-file: ${{ inputs.node-version-file }}
+          working-directory: ${{ inputs.working-directory }}
+      # Next.js build cache: per lockfile, refreshed on every commit.
+      - uses: actions/cache@v6
+        with:
+          path: ${{ inputs.working-directory }}/.next/cache
+          key: next-${{ runner.os }}-${{ hashFiles(format('{0}/**/pnpm-lock.yaml', inputs.working-directory), format('{0}/**/bun.lock', inputs.working-directory), format('{0}/**/yarn.lock', inputs.working-directory)) }}-${{ github.sha }}
+          restore-keys: |
+            next-${{ runner.os }}-${{ hashFiles(format('{0}/**/pnpm-lock.yaml', inputs.working-directory), format('{0}/**/bun.lock', inputs.working-directory), format('{0}/**/yarn.lock', inputs.working-directory)) }}-
+            next-${{ runner.os }}-
+      - name: Build
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.build }}
+      - name: Check the export
+        if: inputs.export-dir != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          OUT: ${{ inputs.export-dir }}
+        run: test -f "$OUT/index.html" && test -f "$OUT/404.html"
+      - name: Stamp the release
+        if: inputs.release != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          OUT: ${{ inputs.export-dir }}
+          RELEASE: ${{ inputs.release }}
+        run: printf '%s\n' "$RELEASE" > "$OUT/version.txt"
+      - uses: actions/upload-artifact@v7
+        if: inputs.release != ''
+        with:
+          name: site
+          path: ${{ inputs.working-directory }}/${{ inputs.export-dir }}/
+          include-hidden-files: true
+          retention-days: 7
+
+  docker:
+    if: inputs.docker-file != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build the image (not pushed)
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.docker-context }}
+          file: ${{ inputs.docker-file }}
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            GIT_SHA=${{ github.event.pull_request.head.sha || github.sha }}
+            ${{ inputs.docker-build-args }}
+          cache-from: type=gha,scope=${{ inputs.docker-cache-scope }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.docker-cache-scope }}
