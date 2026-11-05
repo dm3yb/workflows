@@ -1,0 +1,56 @@
+name: setup
+description: Node, the repo's package manager with its cache, and a frozen-lockfile install
+
+inputs:
+  package-manager:
+    description: pnpm, bun or yarn (yarn 1)
+    default: pnpm
+  node-version:
+    description: Node version; leave empty to use node-version-file
+    default: ''
+  node-version-file:
+    description: File with the Node version (.nvmrc); used when node-version is empty
+    default: ''
+  working-directory:
+    description: Directory with package.json and the lockfile
+    default: .
+
+runs:
+  using: composite
+  steps:
+    - if: inputs.package-manager == 'pnpm'
+      uses: pnpm/action-setup@v6 # reads packageManager from package.json
+      with:
+        package_json_file: ${{ inputs.working-directory }}/package.json
+
+    - uses: actions/setup-node@v7
+      with:
+        node-version: ${{ inputs.node-version }}
+        node-version-file: ${{ inputs.node-version == '' && inputs.node-version-file != '' && format('{0}/{1}', inputs.working-directory, inputs.node-version-file) || '' }}
+        cache: ${{ inputs.package-manager != 'bun' && inputs.package-manager || '' }}
+        cache-dependency-path: ${{ inputs.package-manager == 'pnpm' && format('{0}/pnpm-lock.yaml', inputs.working-directory) || inputs.package-manager == 'yarn' && format('{0}/yarn.lock', inputs.working-directory) || '' }}
+
+    - if: inputs.package-manager == 'bun'
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version-file: ${{ inputs.working-directory }}/package.json
+
+    - if: inputs.package-manager == 'bun'
+      uses: actions/cache@v6
+      with:
+        path: ~/.bun/install/cache
+        key: bun-${{ runner.os }}-${{ hashFiles(format('{0}/bun.lock', inputs.working-directory)) }}
+        restore-keys: bun-${{ runner.os }}-
+
+    - name: Install
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PM: ${{ inputs.package-manager }}
+      run: |
+        case "$PM" in
+          pnpm) pnpm install --frozen-lockfile ;;
+          bun)  bun install --frozen-lockfile ;;
+          yarn) yarn install --frozen-lockfile ;;
+          *) echo "::error::unknown package manager: $PM"; exit 1 ;;
+        esac

@@ -1,0 +1,181 @@
+name: deploy-static
+
+# Builds a static export with ci-next.yml, stamps out/version.txt with <sha>-<run_number> (a Sanity
+# rebuild of the same commit is a new release), and ships it through the server's forced command
+# (server/deploy in dm3yb/infra). Called with `secrets: inherit`.
+#
+# Server contract (one SSH call, pinned host key):
+#   static <site> <release>   stdin: tar.gz of the export (deploy)
+#                             stdin: empty = switch to that release, already on the server (rollback)
+#
+# Caller job permissions: contents: read.
+
+on:
+  workflow_call:
+    inputs:
+      site:
+        description: Site name on the server (/srv/static/<site>)
+        type: string
+        required: true
+      public-url:
+        description: Public URL whose /version.txt must report the new release
+        type: string
+        required: true
+      sha:
+        description: 'Rollback: a release id (<sha>-<run>) or a bare SHA (its newest build on the server). Empty builds github.sha'
+        type: string
+        default: ''
+      package-manager:
+        description: pnpm, bun or yarn (yarn 1)
+        type: string
+        default: pnpm
+      node-version:
+        description: Node version; leave empty to use node-version-file
+        type: string
+        default: ''
+      node-version-file:
+        description: File with the Node version, relative to working-directory
+        type: string
+        default: ''
+      working-directory:
+        description: Directory with package.json
+        type: string
+        default: .
+      env:
+        description: JSON object of environment values for every job
+        type: string
+        default: '{}'
+      lint:
+        description: Lint command; empty skips
+        type: string
+        default: ''
+      typecheck:
+        description: Typecheck command; empty skips
+        type: string
+        default: ''
+      test:
+        description: Test command; empty skips
+        type: string
+        default: ''
+      build:
+        description: Build command that writes the export
+        type: string
+        required: true
+      build-env:
+        description: JSON object of public build-time values
+        type: string
+        default: '{}'
+      export-dir:
+        description: Export directory, relative to working-directory
+        type: string
+        default: out
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    if: inputs.sha == ''
+    uses: dm3yb/workflows/.github/workflows/ci-next.yml@v1
+    with:
+      package-manager: ${{ inputs.package-manager }}
+      node-version: ${{ inputs.node-version }}
+      node-version-file: ${{ inputs.node-version-file }}
+      working-directory: ${{ inputs.working-directory }}
+      env: ${{ inputs.env }}
+      lint: ${{ inputs.lint }}
+      typecheck: ${{ inputs.typecheck }}
+      test: ${{ inputs.test }}
+      build: ${{ inputs.build }}
+      build-env: ${{ inputs.build-env }}
+      export-dir: ${{ inputs.export-dir }}
+      release: ${{ github.sha }}-${{ github.run_number }}
+
+  deploy:
+    needs: ci
+    if: always() && (needs.ci.result == 'success' || (inputs.sha != '' && needs.ci.result == 'skipped'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: deploy-${{ inputs.site }}
+      cancel-in-progress: false
+    steps:
+      - name: Release to deploy
+        id: rel
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          skip=false
+          if [[ -n "$INPUT_SHA" ]]; then
+            [[ "$INPUT_SHA" =~ ^[0-9a-f]{40}(-[0-9]{1,12})?$ ]] || { echo "::error::not a SHA or release id: $INPUT_SHA"; exit 1; }
+            echo "mode=rollback" >> "$GITHUB_OUTPUT"; echo "id=$INPUT_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=deploy" >> "$GITHUB_OUTPUT"; echo "id=$GITHUB_SHA-$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
+            # Freshness guard: a deploy never moves backwards. Rollbacks bypass it.
+            head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+            if [[ "$head" != "$GITHUB_SHA" ]]; then
+              echo "::notice::main moved on to $head; skipping the deploy of $GITHUB_SHA"
+              skip=true
+            fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        if: steps.rel.outputs.mode == 'deploy' && steps.rel.outputs.skip == 'false'
+        with:
+          name: site
+          path: out
+
+      - name: SSH key and pinned host key
+        if: steps.rel.outputs.skip == 'false'
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY_V2 }}
+          DEPLOY_KNOWN_HOSTS: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+        run: |
+          [[ -n "$DEPLOY_SSH_KEY" ]] || { echo "::error::DEPLOY_SSH_KEY_V2 is not set"; exit 1; }
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf 'Host target\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/deploy\n  IdentitiesOnly yes\n  BatchMode yes\n  StrictHostKeyChecking yes\n' \
+            "$DEPLOY_HOST" "$DEPLOY_USER" > ~/.ssh/config
+
+      # The server unpacks into releases/<id> and swaps the `current` symlink atomically.
+      - name: Deploy ${{ steps.rel.outputs.id }}
+        if: steps.rel.outputs.mode == 'deploy' && steps.rel.outputs.skip == 'false'
+        env:
+          SITE: ${{ inputs.site }}
+          ID: ${{ steps.rel.outputs.id }}
+        run: |
+          # shellcheck disable=SC2029  # the arguments go to the forced command on the server
+          tar -czf - -C out . | ssh target static "$SITE" "$ID"
+
+      # Empty stdin: switch to a release that is still on the server (it keeps the newest 5).
+      - name: Roll back to ${{ steps.rel.outputs.id }}
+        if: steps.rel.outputs.mode == 'rollback'
+        env:
+          SITE: ${{ inputs.site }}
+          ID: ${{ steps.rel.outputs.id }}
+        run: |
+          # shellcheck disable=SC2029
+          ssh target static "$SITE" "$ID" </dev/null
+
+      # Until a domain's cutover, SMOKE_VIA_ORIGIN=true sends the check straight to the server.
+      - name: Smoke test
+        if: steps.rel.outputs.skip == 'false'
+        env:
+          URL: ${{ inputs.public-url }}
+          MODE: ${{ steps.rel.outputs.mode }}
+          ID: ${{ steps.rel.outputs.id }}
+          VIA_ORIGIN: ${{ vars.SMOKE_VIA_ORIGIN }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+        run: |
+          args=(-fsS --max-time 10)
+          if [[ "$VIA_ORIGIN" == "true" ]]; then args+=(-k --resolve "${URL#https://}:443:$DEPLOY_HOST"); fi
+          live=$(curl "${args[@]}" "$URL/version.txt?r=$GITHUB_RUN_ID")
+          if [[ "$MODE" == "deploy" && "$live" != "$ID" ]]; then echo "::error::live release is $live, expected $ID"; exit 1; fi
+          if [[ "$MODE" == "rollback" && "$live" != "$ID"* ]]; then echo "::error::live release is $live, expected $ID"; exit 1; fi
+          curl "${args[@]}" -o /dev/null -w "GET / -> %{http_code}\n" "$URL/"
+          echo "live: $live"
