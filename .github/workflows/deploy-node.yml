@@ -123,8 +123,10 @@ jobs:
           # In a monorepo the standalone tree mirrors the repo, so server.js sits under the app's path.
           dest="$rel"; [[ "$APP_DIR" == . ]] || dest="$rel/$APP_DIR"
           [[ -f "$dest/server.js" ]] || { echo "::error::no server.js in the standalone output (output: 'standalone'?)"; exit 1; }
-          cp -a "$APP_DIR/.next/static" "$dest/.next/static"
-          if [[ -d "$APP_DIR/public" ]]; then cp -a "$APP_DIR/public" "$dest/public"; fi
+          # Copy the contents: the standalone output may already hold a few traced files in these folders.
+          mkdir -p "$dest/.next/static" && cp -a "$APP_DIR/.next/static/." "$dest/.next/static/"
+          if [[ -d "$APP_DIR/public" ]]; then mkdir -p "$dest/public" && cp -a "$APP_DIR/public/." "$dest/public/"; fi
+          [[ ! -e "$dest/public/public" && ! -e "$dest/.next/static/static" ]] || { echo "::error::public or static copied one level too deep"; exit 1; }
           # Runtime env comes from the server; never ship env files or the build cache.
           find "$rel" -name '.env*' -type f -delete; rm -rf "$dest/.next/cache"
           printf '%s\n' "$GITHUB_SHA" > "$rel/RELEASE"
