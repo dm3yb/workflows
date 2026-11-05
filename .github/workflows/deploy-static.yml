@@ -69,6 +69,12 @@ on:
         description: Export directory, relative to working-directory
         type: string
         default: out
+    # Declared so a caller in another organization can pass it explicitly: `secrets: inherit` only
+    # works within one organization (aerixity-labs/dither-studio calls this from outside dm3yb).
+    secrets:
+      DEPLOY_SSH_KEY_V2:
+        description: SSH key for the server's forced command
+        required: false
 
 permissions:
   contents: read

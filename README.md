@@ -2,7 +2,7 @@
 
 Reusable GitHub Actions workflows for the aerixity deploys. Public on purpose:
 `aerixity-labs/dither-studio` lives under another owner and could not call them from a private repo.
-**No secrets live here.** Callers pass theirs with `secrets: inherit`, and repo variables resolve in
+**No secrets live here.** Callers pass theirs with `secrets: inherit` (a caller in another organization, like dither-studio, must pass `DEPLOY_SSH_KEY_V2` explicitly instead), and repo variables resolve in
 the caller.
 
 Pin `@v1`. The workflows call each other and `.github/actions/setup` at `@v1` too, so a release is
