@@ -1,112 +1,63 @@
 name: deploy-node
 
-# Builds a Node app image, pushes ghcr.io/dm3yb/<app>:<sha>, and deploys it blue/green through the
-# server's forced command (server/deploy in dm3yb/infra). Called with `secrets: inherit`.
+# Builds a Next.js standalone server (`output: 'standalone'`) and ships it to the server with rsync;
+# the server's forced command (server/deploy in dm3yb/infra) makes it a release and reloads it in PM2.
+# Called with `secrets: inherit`.
 #
-# Server contract (two SSH calls, pinned host key):
-#   env <app>          stdin: the app's env file (secret named by env-file-secret)
-#   node <app> <sha>   stdin: a registry token for a one-time GHCR pull; empty for a rollback,
-#                      so the server uses the image it already has
+# Server contract (pinned host key):
+#   rsync … <app>/      the release (standalone + .next/static + public + RELEASE) into /srv/incoming/<app>
+#   node <app> <sha>    switch to that release and reload; for a rollback, a release already on disk
 #
-# Caller job permissions: contents: read, packages: write.
+# Runtime secrets live only in /srv/env/<app>.env on the server; the build gets public values and
+# placeholders through build-env. Caller job permissions: contents: read.
 
 on:
   workflow_call:
     inputs:
       app:
-        description: App name on the server and in GHCR (ghcr.io/dm3yb/<app>)
+        description: App name on the server (/srv/apps/<app>, the PM2 process)
         type: string
         required: true
       public-url:
         description: Public URL whose /api/health must report the new SHA
         type: string
         required: true
-      dockerfile:
-        description: Dockerfile path
+      sha:
+        description: Rollback to this commit's release (still on the server); empty builds github.sha
         type: string
-        default: Dockerfile
-      context:
-        description: Docker build context
+        default: ''
+      package-manager:
+        description: pnpm, bun or yarn (yarn 1)
+        type: string
+        default: pnpm
+      node-version:
+        description: Node version; the server runs Node 24
+        type: string
+        default: '24'
+      app-dir:
+        description: The Next.js app's directory from the repo root (in a monorepo, apps/<name>)
         type: string
         default: .
-      build-args:
-        description: Build args, one KEY=value per line (GIT_SHA is always set)
+      build:
+        description: Build command, run from the repo root
         type: string
-        default: ''
-      env-file-secret:
-        description: Name of the secret holding the app's runtime env file
+        default: pnpm build
+      build-env:
+        description: JSON object of build-time values (NEXT_PUBLIC_*, placeholders the env check needs)
         type: string
-        default: APP_ENV_FILE
-      sha:
-        description: Rollback to this commit's image (already on the server); empty builds github.sha
-        type: string
-        default: ''
-      keep-images:
-        description: Image versions kept in GHCR
-        type: number
-        default: 3
+        default: '{}'
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    if: inputs.sha == ''
+  deploy:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    concurrency:
-      group: build-${{ inputs.app }}
-      cancel-in-progress: true
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push ghcr.io/dm3yb/${{ inputs.app }}:${{ github.sha }}
-        uses: docker/build-push-action@v7
-        with:
-          context: ${{ inputs.context }}
-          file: ${{ inputs.dockerfile }}
-          platforms: linux/amd64
-          push: true
-          provenance: false
-          tags: ghcr.io/dm3yb/${{ inputs.app }}:${{ github.sha }}
-          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
-          build-args: |
-            GIT_SHA=${{ github.sha }}
-            ${{ inputs.build-args }}
-          secrets: |
-            sentry_auth_token=${{ secrets.SENTRY_AUTH_TOKEN }}
-            server_actions_key=${{ secrets.NEXT_SERVER_ACTIONS_ENCRYPTION_KEY }}
-          cache-from: type=gha,scope=${{ inputs.app }}
-          cache-to: type=gha,mode=max,scope=${{ inputs.app }}
-      - name: Check the Sentry release
-        env:
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-        run: |
-          [[ -n "$SENTRY_AUTH_TOKEN" ]] || { echo "::warning::SENTRY_AUTH_TOKEN is not set: no source maps"; exit 0; }
-          curl -fsS -o /dev/null -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" \
-            "https://de.sentry.io/api/0/organizations/aerixity/releases/$GITHUB_SHA/" \
-            || echo "::warning::Sentry release $GITHUB_SHA not found: source maps were not uploaded"
-
-  deploy:
-    needs: build
-    # After a successful build, or alone for a rollback (build skipped).
-    if: always() && (needs.build.result == 'success' || (inputs.sha != '' && needs.build.result == 'skipped'))
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Not cancelled midway: a newer run waits, and the freshness guard then skips the older commit.
     concurrency:
       group: deploy-${{ inputs.app }}
       cancel-in-progress: false
-    permissions:
-      contents: read
-      packages: write # the server pulls with this token; retention deletes old versions
     steps:
       - name: Commit to deploy
         id: sha
@@ -119,14 +70,75 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           # Freshness guard: a deploy never moves backwards. Rollbacks (INPUT_SHA set) bypass it.
           skip=false
-          if [[ -z "$INPUT_SHA" ]]; then
-            head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
-            if [[ "$head" != "$sha" ]]; then
-              echo "::notice::main moved on to $head; skipping the deploy of $sha"
-              skip=true
-            fi
+          if [[ -z "$INPUT_SHA" && "$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" != "$sha" ]]; then
+            echo "::notice::main moved on; skipping the deploy of $sha"; skip=true
           fi
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          echo "build=$([[ "$skip" == false && -z "$INPUT_SHA" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        if: steps.sha.outputs.build == 'true'
+
+      - name: Environment
+        if: steps.sha.outputs.build == 'true'
+        env:
+          BUILD_ENV_JSON: ${{ inputs.build-env }}
+        run: |
+          jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$BUILD_ENV_JSON" >> "$GITHUB_ENV"
+          # What the app reads at build time; PM2 sets the same at runtime (infra ecosystem.config.js).
+          printf '%s\n' "GIT_SHA=$GITHUB_SHA" "SENTRY_RELEASE=$GITHUB_SHA" "VERCEL_DEPLOYMENT_ID=$GITHUB_SHA" \
+            VERCEL_ENV=production NEXT_PUBLIC_VERCEL_ENV=production NEXT_TELEMETRY_DISABLED=1 >> "$GITHUB_ENV"
+
+      - uses: dm3yb/workflows/.github/actions/setup@v2
+        if: steps.sha.outputs.build == 'true'
+        with:
+          package-manager: ${{ inputs.package-manager }}
+          node-version: ${{ inputs.node-version }}
+
+      - uses: actions/cache@v6
+        if: steps.sha.outputs.build == 'true'
+        with:
+          path: ${{ inputs.app-dir }}/.next/cache
+          key: next-${{ inputs.app }}-${{ hashFiles('**/pnpm-lock.yaml', '**/bun.lock', '**/yarn.lock') }}-${{ github.sha }}
+          restore-keys: next-${{ inputs.app }}-${{ hashFiles('**/pnpm-lock.yaml', '**/bun.lock', '**/yarn.lock') }}-
+
+      # The Server Actions key is embedded in the build; one key keeps action IDs stable across releases.
+      - name: Build
+        if: steps.sha.outputs.build == 'true'
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          ACTIONS_KEY: ${{ secrets.NEXT_SERVER_ACTIONS_ENCRYPTION_KEY }}
+        run: |
+          if [[ -n "$ACTIONS_KEY" ]]; then export NEXT_SERVER_ACTIONS_ENCRYPTION_KEY="$ACTIONS_KEY"; fi
+          unset ACTIONS_KEY
+          ${{ inputs.build }}
+
+      - name: Assemble the release
+        if: steps.sha.outputs.build == 'true'
+        env:
+          APP_DIR: ${{ inputs.app-dir }}
+        run: |
+          rel="$RUNNER_TEMP/release"; rm -rf "$rel" && mkdir -p "$rel"
+          cp -a "$APP_DIR/.next/standalone/." "$rel/"
+          # In a monorepo the standalone tree mirrors the repo, so server.js sits under the app's path.
+          dest="$rel"; [[ "$APP_DIR" == . ]] || dest="$rel/$APP_DIR"
+          [[ -f "$dest/server.js" ]] || { echo "::error::no server.js in the standalone output (output: 'standalone'?)"; exit 1; }
+          cp -a "$APP_DIR/.next/static" "$dest/.next/static"
+          if [[ -d "$APP_DIR/public" ]]; then cp -a "$APP_DIR/public" "$dest/public"; fi
+          # Runtime env comes from the server; never ship env files or the build cache.
+          find "$rel" -name '.env*' -type f -delete; rm -rf "$dest/.next/cache"
+          printf '%s\n' "$GITHUB_SHA" > "$rel/RELEASE"
+          echo "release: $(du -sh "$rel" | cut -f1), $(find "$rel" -type f | wc -l) files"
+
+      - name: Check the Sentry release
+        if: steps.sha.outputs.build == 'true'
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          [[ -n "$SENTRY_AUTH_TOKEN" ]] || { echo "::warning::SENTRY_AUTH_TOKEN is not set: no source maps"; exit 0; }
+          curl -fsS -o /dev/null -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" \
+            "https://de.sentry.io/api/0/organizations/aerixity/releases/$GITHUB_SHA/" \
+            || echo "::warning::Sentry release $GITHUB_SHA not found: source maps were not uploaded"
 
       - name: SSH key and pinned host key
         if: steps.sha.outputs.skip == 'false'
@@ -143,42 +155,36 @@ jobs:
           printf 'Host target\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/deploy\n  IdentitiesOnly yes\n  BatchMode yes\n  StrictHostKeyChecking yes\n' \
             "$DEPLOY_HOST" "$DEPLOY_USER" > ~/.ssh/config
 
-      - name: Write the env file
-        if: steps.sha.outputs.skip == 'false'
+      # --checksum leaves unchanged files untouched, so releases share them as hard links on the server.
+      - name: Upload
+        if: steps.sha.outputs.build == 'true'
         env:
           APP: ${{ inputs.app }}
-          ENV_FILE: ${{ secrets[inputs.env-file-secret] }}
-          SECRET_NAME: ${{ inputs.env-file-secret }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          [[ -n "$ENV_FILE" ]] || { echo "::error::secret $SECRET_NAME is empty or not set"; exit 1; }
-          # shellcheck disable=SC2029  # the arguments go to the forced command on the server
-          printf '%s\n' "$ENV_FILE" | ssh target env "$APP"
+          if [[ "$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" != "$GITHUB_SHA" ]]; then
+            echo "::notice::main moved on during the build; not uploading $GITHUB_SHA"; echo "SKIP=1" >> "$GITHUB_ENV"; exit 0
+          fi
+          rsync -a --delete --checksum --stats "$RUNNER_TEMP/release/" "target:$APP/" | grep -E 'Total (transferred )?file size|Literal data'
 
-      # Blue/green on the server. A rollback sends no token: the server uses its local image.
       - name: Deploy ${{ steps.sha.outputs.sha }}
-        if: steps.sha.outputs.skip == 'false'
+        if: steps.sha.outputs.skip == 'false' && env.SKIP != '1'
         env:
           APP: ${{ inputs.app }}
           SHA: ${{ steps.sha.outputs.sha }}
-          TOKEN: ${{ inputs.sha == '' && secrets.GITHUB_TOKEN || '' }}
         run: |
-          # shellcheck disable=SC2029
-          printf '%s\n' "$TOKEN" | ssh target node "$APP" "$SHA"
+          # shellcheck disable=SC2029  # the arguments go to the forced command on the server
+          ssh target node "$APP" "$SHA" </dev/null
 
-      # Until a domain's cutover, SMOKE_VIA_ORIGIN=true sends the check straight to the server.
       - name: Smoke test
-        if: steps.sha.outputs.skip == 'false'
+        if: steps.sha.outputs.skip == 'false' && env.SKIP != '1'
         env:
           URL: ${{ inputs.public-url }}
           SHA: ${{ steps.sha.outputs.sha }}
-          VIA_ORIGIN: ${{ vars.SMOKE_VIA_ORIGIN }}
-          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
         run: |
-          args=(-fsS --max-time 10)
-          if [[ "$VIA_ORIGIN" == "true" ]]; then args+=(-k --resolve "${URL#https://}:443:$DEPLOY_HOST"); fi
           for _ in $(seq 1 10); do
-            if body=$(curl "${args[@]}" "$URL/api/health") && [[ "$body" == *"\"sha\":\"$SHA\""* ]]; then
-              curl "${args[@]}" -o /dev/null -w "GET / -> %{http_code}\n" "$URL/"
+            if body=$(curl -fsS --max-time 10 "$URL/api/health") && [[ "$body" == *"\"sha\":\"$SHA\""* ]]; then
+              curl -fsS --max-time 10 -o /dev/null -w "GET / -> %{http_code}\n" "$URL/"
               echo "live: $body"; exit 0
             fi
             sleep 3
@@ -186,7 +192,7 @@ jobs:
           echo "::error::$URL/api/health does not report $SHA"; exit 1
 
       - name: Mark the Sentry release as deployed
-        if: steps.sha.outputs.skip == 'false'
+        if: steps.sha.outputs.skip == 'false' && env.SKIP != '1'
         continue-on-error: true
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
@@ -195,14 +201,3 @@ jobs:
           [[ -n "$SENTRY_AUTH_TOKEN" ]] || exit 0
           curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" -H 'Content-Type: application/json' \
             -d '{"environment":"production"}' "https://de.sentry.io/api/0/organizations/aerixity/releases/$SHA/deploys/"
-
-      # Keep the newest image versions in GHCR. The one just deployed is the newest, so it stays;
-      # older images the server still holds remain usable for a rollback (it sends no token).
-      - name: Prune old image versions
-        if: steps.sha.outputs.skip == 'false' && inputs.sha == ''
-        continue-on-error: true
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: ${{ inputs.app }}
-          package-type: container
-          min-versions-to-keep: ${{ inputs.keep-images }}

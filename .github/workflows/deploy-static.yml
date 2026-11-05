@@ -2,11 +2,11 @@ name: deploy-static
 
 # Builds a static export with ci-next.yml, stamps out/version.txt with <sha>-<run_number> (a Sanity
 # rebuild of the same commit is a new release), and ships it through the server's forced command
-# (server/deploy in dm3yb/infra). Called with `secrets: inherit`.
+# (server/deploy in dm3yb/infra) with rsync. Called with `secrets: inherit`.
 #
 # Server contract (one SSH call, pinned host key):
-#   static <site> <release>   stdin: tar.gz of the export (deploy)
-#                             stdin: empty = switch to that release, already on the server (rollback)
+#   rsync … <site>/           the export plus a RELEASE file into /srv/incoming/<site> (deploy)
+#   static <site> <release>   switch to the upload, or to a release still on the server (rollback)
 #
 # Caller job permissions: contents: read.
 
@@ -82,7 +82,7 @@ permissions:
 jobs:
   ci:
     if: inputs.sha == ''
-    uses: dm3yb/workflows/.github/workflows/ci-next.yml@v1
+    uses: dm3yb/workflows/.github/workflows/ci-next.yml@v2
     with:
       package-manager: ${{ inputs.package-manager }}
       node-version: ${{ inputs.node-version }}
@@ -148,15 +148,17 @@ jobs:
           printf 'Host target\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/deploy\n  IdentitiesOnly yes\n  BatchMode yes\n  StrictHostKeyChecking yes\n' \
             "$DEPLOY_HOST" "$DEPLOY_USER" > ~/.ssh/config
 
-      # The server unpacks into releases/<id> and swaps the `current` symlink atomically.
+      # rsync into /srv/incoming/<site>; the server copies it to releases/<id> and swaps `current`.
       - name: Deploy ${{ steps.rel.outputs.id }}
         if: steps.rel.outputs.mode == 'deploy' && steps.rel.outputs.skip == 'false'
         env:
           SITE: ${{ inputs.site }}
           ID: ${{ steps.rel.outputs.id }}
         run: |
+          printf '%s\n' "$ID" > out/RELEASE
+          rsync -a --delete --checksum --stats out/ "target:$SITE/" | grep -E 'Total (transferred )?file size|Literal data'
           # shellcheck disable=SC2029  # the arguments go to the forced command on the server
-          tar -czf - -C out . | ssh target static "$SITE" "$ID"
+          ssh target static "$SITE" "$ID" </dev/null
 
       # Empty stdin: switch to a release that is still on the server (it keeps the newest 5).
       - name: Roll back to ${{ steps.rel.outputs.id }}
