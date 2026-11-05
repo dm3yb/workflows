@@ -1,7 +1,7 @@
 name: ci-next
 
-# Checks for a Next.js app: lint, typecheck, test and build as parallel jobs, plus an optional
-# Docker build without push. Callers set `concurrency: ci-${{ github.ref }}` with cancel-in-progress.
+# Checks for a Next.js app: lint, typecheck, test and build as parallel jobs. Callers set
+# `concurrency: ci-${{ github.ref }}` with cancel-in-progress.
 # deploy-static.yml reuses the build job with `release` set, to stamp and upload the export.
 
 on:

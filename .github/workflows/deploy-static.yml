@@ -170,18 +170,15 @@ jobs:
           # shellcheck disable=SC2029
           ssh target static "$SITE" "$ID" </dev/null
 
-      # Until a domain's cutover, SMOKE_VIA_ORIGIN=true sends the check straight to the server.
+      # Through Cloudflare, the only way in: /version.txt must report the release.
       - name: Smoke test
         if: steps.rel.outputs.skip == 'false'
         env:
           URL: ${{ inputs.public-url }}
           MODE: ${{ steps.rel.outputs.mode }}
           ID: ${{ steps.rel.outputs.id }}
-          VIA_ORIGIN: ${{ vars.SMOKE_VIA_ORIGIN }}
-          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
         run: |
           args=(-fsS --max-time 10)
-          if [[ "$VIA_ORIGIN" == "true" ]]; then args+=(-k --resolve "${URL#https://}:443:$DEPLOY_HOST"); fi
           live=$(curl "${args[@]}" "$URL/version.txt?r=$GITHUB_RUN_ID")
           if [[ "$MODE" == "deploy" && "$live" != "$ID" ]]; then echo "::error::live release is $live, expected $ID"; exit 1; fi
           if [[ "$MODE" == "rollback" && "$live" != "$ID"* ]]; then echo "::error::live release is $live, expected $ID"; exit 1; fi
